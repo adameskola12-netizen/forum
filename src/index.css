@@ -1,0 +1,32 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --ink: #1a1612;
+  --paper: #faf7f2;
+  --paperDeep: #f4efe6;
+  --line: #e8e0d2;
+  --muted: #8a7f70;
+  --accent: #b8532a;
+  --good: #4a6b5c;
+  --bad: #b8532a;
+}
+
+body {
+  margin: 0;
+  font-family: 'Inter', -apple-system, sans-serif;
+  color: var(--ink);
+  background: var(--paper);
+  -webkit-font-smoothing: antialiased;
+}
+
+.font-serif {
+  font-family: 'Fraunces', 'Georgia', serif;
+  font-feature-settings: 'ss01';
+}
+
+::selection {
+  background: var(--accent);
+  color: var(--paper);
+}
