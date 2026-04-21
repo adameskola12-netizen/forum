@@ -7,8 +7,14 @@ import {
   Cell, ReferenceLine,
 } from "recharts";
 import {
-  Upload, ArrowUpRight, ArrowDownRight, Trash2,
+  Upload, ArrowUpRight, ArrowDownRight, Trash2, LogOut,
 } from "lucide-react";
+import { useAuth } from "./lib/auth";
+import {
+  fetchTransactions, insertTransactions,
+  fetchGoals, upsertGoal,
+  recordUpload, clearAllData,
+} from "./lib/data";
 
 // ————————————————————————————————————————————————————————————————
 // THEME — warm editorial palette, not generic SaaS
@@ -117,9 +123,12 @@ function normalizeRows(rows) {
     .map((r) => {
       const dt = r["Date (UTC)"] ? new Date(r["Date (UTC)"].replace(" ", "T") + "Z") : null;
       if (!dt || isNaN(dt.getTime())) return null;
+      // Central time approximation: -5h fixed offset. Used for day-level bucketing.
+      // Original UTC preserved in dateUtc so DB storage is canonical.
       const local = new Date(dt.getTime() - 5 * 3600_000);
       return {
         id: r.ID,
+        dateUtc: dt,
         date: local,
         dateKey: ymd(local),
         source: r.Source || "OTHER",
@@ -136,6 +145,7 @@ function normalizeRows(rows) {
         netRevenue: num(r["Net Revenue"]),
         paymentMethod: r["Payment Method"] || "",
         reportingCategory: r["Reporting Category"] || "",
+        raw: r,
       };
     })
     .filter(Boolean);
@@ -265,29 +275,6 @@ function projectPeriod(dailyRows, elapsedDays, totalDays, totalToDate) {
 }
 
 // ————————————————————————————————————————————————————————————————
-// STORAGE — localStorage (replaces window.storage from artifact)
-// ————————————————————————————————————————————————————————————————
-const GOALS_KEY = "forum_goals_v1";
-const DATA_KEY = "forum_data_v1";
-
-function saveData(key, value) {
-  try {
-    localStorage.setItem(key, JSON.stringify(value));
-  } catch (e) {
-    console.error("save error", e);
-  }
-}
-function loadData(key) {
-  try {
-    const r = localStorage.getItem(key);
-    if (r) return JSON.parse(r);
-  } catch (e) {
-    console.error("load error", e);
-  }
-  return null;
-}
-
-// ————————————————————————————————————————————————————————————————
 // UI PRIMITIVES
 // ————————————————————————————————————————————————————————————————
 const KPICard = ({ label, value, sub, trend, accent }) => (
@@ -347,36 +334,183 @@ const TooltipBox = ({ active, payload, label, formatter }) => {
 };
 
 // ————————————————————————————————————————————————————————————————
-// MAIN APP
+// SIGN-IN SCREEN
+// ————————————————————————————————————————————————————————————————
+function SignInScreen({ onSignIn }) {
+  const [email, setEmail] = useState("");
+  const [sending, setSending] = useState(false);
+  const [sent, setSent] = useState(false);
+  const [error, setError] = useState("");
+
+  const submit = async (e) => {
+    e.preventDefault();
+    setSending(true); setError("");
+    const { error } = await onSignIn(email.trim());
+    setSending(false);
+    if (error) {
+      // Supabase returns specific error messages. Common ones:
+      // "Signups not allowed for otp" / "User not found"
+      // Surface verbatim for now; Phase D will humanize.
+      setError(error.message || "Could not send magic link.");
+    } else {
+      setSent(true);
+    }
+  };
+
+  return (
+    <div className="min-h-screen bg-[color:var(--paper)] flex items-center justify-center p-6">
+      <div className="max-w-md w-full">
+        <div className="text-[10px] tracking-[0.3em] uppercase text-[color:var(--accent)] mb-3">Forum Delano · Performance</div>
+        <h1 className="text-5xl font-serif text-[color:var(--ink)] leading-tight mb-3">The House Ledger</h1>
+        <p className="text-[color:var(--muted)] mb-8 font-serif italic text-lg">Sign in to continue.</p>
+
+        {!sent ? (
+          <form onSubmit={submit} className="space-y-3">
+            <label className="block text-[10px] tracking-[0.2em] uppercase text-[color:var(--muted)] mb-2">Email</label>
+            <input
+              type="email"
+              required
+              autoFocus
+              value={email}
+              onChange={(e) => setEmail(e.target.value)}
+              placeholder="you@forumdelano.com"
+              className="w-full p-3 bg-transparent border-b border-[color:var(--line)] focus:border-[color:var(--ink)] outline-none font-serif text-lg"
+            />
+            <button
+              type="submit"
+              disabled={sending || !email}
+              className="w-full bg-[color:var(--ink)] text-[color:var(--paper)] px-6 py-3 text-xs tracking-[0.2em] uppercase disabled:opacity-40 mt-4"
+            >
+              {sending ? "Sending..." : "Send magic link"}
+            </button>
+            {error && (
+              <div className="mt-4 p-3 border border-[color:var(--bad)] bg-[color:var(--accent)]/5 text-sm text-[color:var(--bad)]">
+                {error}
+              </div>
+            )}
+            <div className="mt-6 text-xs text-[color:var(--muted)] leading-relaxed">
+              Access is invite-only. If your email isn't recognized, ask the Forum owner to invite you.
+            </div>
+          </form>
+        ) : (
+          <div className="border border-[color:var(--line)] bg-[color:var(--paper)] p-5">
+            <div className="text-[10px] tracking-[0.2em] uppercase text-[color:var(--accent)] mb-2">Check your inbox</div>
+            <div className="font-serif text-xl mb-2">A link is on its way</div>
+            <div className="text-sm text-[color:var(--muted)] leading-relaxed">
+              We sent a sign-in link to <span className="text-[color:var(--ink)] font-medium">{email}</span>. Click it to open the dashboard. The link is valid for one hour and works once.
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ————————————————————————————————————————————————————————————————
+// CLEAR DATA CONFIRMATION MODAL
+// ————————————————————————————————————————————————————————————————
+function ConfirmClearModal({ onConfirm, onCancel, clearing, error }) {
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-6 bg-[color:var(--ink)]/40 backdrop-blur-sm">
+      <div className="max-w-md w-full border border-[color:var(--ink)] bg-[color:var(--paper)] p-6 shadow-xl">
+        <div className="text-[10px] tracking-[0.3em] uppercase text-[color:var(--bad)] mb-2">Destructive action</div>
+        <div className="font-serif text-xl leading-tight mb-4 text-[color:var(--ink)]">
+          WARNING — THIS WILL CLEAR ALL DATA IN SUPABASE, DO YOU WANT TO CONTINUE
+        </div>
+        <div className="text-xs text-[color:var(--muted)] leading-relaxed mb-5">
+          All transactions and goals will be permanently deleted. Team members and the uploads audit log are preserved.
+          This cannot be undone. You'll need to re-upload every CSV to rebuild the dataset.
+        </div>
+        {error && (
+          <div className="mb-4 p-3 border border-[color:var(--bad)] text-sm text-[color:var(--bad)]">
+            {error}
+          </div>
+        )}
+        <div className="flex gap-2">
+          <button
+            onClick={onCancel}
+            disabled={clearing}
+            className="flex-1 border border-[color:var(--line)] bg-transparent px-4 py-3 text-xs tracking-[0.15em] uppercase hover:border-[color:var(--ink)] disabled:opacity-40"
+          >
+            No — keep my data
+          </button>
+          <button
+            onClick={onConfirm}
+            disabled={clearing}
+            className="flex-1 bg-[color:var(--bad)] text-[color:var(--paper)] px-4 py-3 text-xs tracking-[0.15em] uppercase disabled:opacity-40"
+          >
+            {clearing ? "Clearing..." : "Yes, clear all data"}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ————————————————————————————————————————————————————————————————
+// ROOT — auth gate
 // ————————————————————————————————————————————————————————————————
 export default function ForumDashboard() {
+  const { session, user, profile, loading, signIn, signOut } = useAuth();
+
+  if (loading) {
+    return (
+      <div className="min-h-screen bg-[color:var(--paper)] flex items-center justify-center text-[color:var(--muted)] font-serif italic">
+        Preparing the books…
+      </div>
+    );
+  }
+
+  if (!session) {
+    return <SignInScreen onSignIn={signIn} />;
+  }
+
+  return <DashboardApp user={user} profile={profile} signOut={signOut} />;
+}
+
+// ————————————————————————————————————————————————————————————————
+// DASHBOARD — authenticated
+// ————————————————————————————————————————————————————————————————
+function DashboardApp({ user, profile, signOut }) {
   const [rows, setRows] = useState([]);
-  const [loaded, setLoaded] = useState(false);
+  const [loadedData, setLoadedData] = useState(false);
   const [tab, setTab] = useState("overview");
   const [period, setPeriod] = useState("month");
   const [anchor, setAnchor] = useState(new Date(2026, 2, 15));
   const [goals, setGoals] = useState({});
   const [uploading, setUploading] = useState(false);
   const [error, setError] = useState("");
+  const [showClearModal, setShowClearModal] = useState(false);
+  const [clearing, setClearing] = useState(false);
+  const [clearError, setClearError] = useState("");
 
+  // Initial load: transactions + goals from Supabase.
+  // Also one-time cleanup of legacy localStorage keys from the pre-Supabase version.
   useEffect(() => {
-    const savedRows = loadData(DATA_KEY);
-    const savedGoals = loadData(GOALS_KEY);
-    if (savedRows?.length) {
-      setRows(savedRows.map(r => ({ ...r, date: new Date(r.date) })));
-    }
-    if (savedGoals) setGoals(savedGoals);
-    setLoaded(true);
+    try {
+      localStorage.removeItem("forum_data_v1");
+      localStorage.removeItem("forum_goals_v1");
+    } catch { /* no-op */ }
+
+    let active = true;
+    (async () => {
+      try {
+        const [txns, gs] = await Promise.all([fetchTransactions(), fetchGoals()]);
+        if (!active) return;
+        setRows(txns);
+        setGoals(gs);
+      } catch (e) {
+        if (!active) return;
+        setError(e.message || "Failed to load data.");
+      } finally {
+        if (active) setLoadedData(true);
+      }
+    })();
+    return () => { active = false; };
   }, []);
 
-  useEffect(() => {
-    if (loaded && rows.length > 0) {
-      const serializable = rows.map(r => ({ ...r, date: r.date.toISOString() }));
-      saveData(DATA_KEY, serializable);
-    }
-  }, [rows, loaded]);
-  useEffect(() => { if (loaded) saveData(GOALS_KEY, goals); }, [goals, loaded]);
-
+  // When rows arrive or change, snap anchor to the latest transaction date
+  // (same behavior as pre-Supabase version).
   useEffect(() => {
     if (rows.length > 0) {
       const maxDate = rows.reduce((m, r) => (r.date > m ? r.date : m), rows[0].date);
@@ -392,21 +526,80 @@ export default function ForumDashboard() {
         const parsed = await parseCSVFile(f);
         allNew.push(...normalizeRows(parsed));
       }
-      const existingIds = new Set(rows.map(r => r.id));
-      const merged = [...rows, ...allNew.filter(r => !existingIds.has(r.id))];
-      merged.sort((a, b) => a.date - b.date);
-      setRows(merged);
+      if (!allNew.length) {
+        setError("No valid rows parsed from the CSVs.");
+        return;
+      }
+
+      const { added, skipped } = await insertTransactions(allNew, user.id);
+
+      // Audit log entry. Summarize dates using raw UTC from the parsed rows.
+      const earliest = allNew.reduce((m, r) => (r.dateUtc < m ? r.dateUtc : m), allNew[0].dateUtc);
+      const latest = allNew.reduce((m, r) => (r.dateUtc > m ? r.dateUtc : m), allNew[0].dateUtc);
+      await recordUpload({
+        uploadedBy: user.id,
+        fileName: files.length > 1 ? `${files.length} files (${files[0].name} + ${files.length - 1})` : files[0].name,
+        rowsAdded: added,
+        rowsSkipped: skipped,
+        rowsFailed: 0,
+        earliestDate: earliest,
+        latestDate: latest,
+      });
+
+      // Refetch so the UI reflects server state.
+      const txns = await fetchTransactions();
+      setRows(txns);
     } catch (e) {
-      setError(e.message || "Failed to parse CSV.");
+      setError(e.message || "Failed to upload CSV.");
     } finally {
       setUploading(false);
     }
   };
 
-  const clearData = () => {
-    if (confirm("Clear all transaction data? Goals will be kept.")) {
+  const requestClear = () => {
+    setClearError("");
+    setShowClearModal(true);
+  };
+  const handleClearConfirm = async () => {
+    setClearing(true); setClearError("");
+    try {
+      await clearAllData();
       setRows([]);
-      saveData(DATA_KEY, []);
+      setGoals({});
+      setShowClearModal(false);
+    } catch (e) {
+      setClearError(e.message || "Could not clear data. You may not have permission.");
+    } finally {
+      setClearing(false);
+    }
+  };
+
+  // Goal setter: optimistic UI, reconcile from server on failure.
+  const setGoal = async (goalKey, field, val) => {
+    const prev = goals[goalKey]?.[field];
+    setGoals((g) => ({ ...g, [goalKey]: { ...(g[goalKey] || {}), [field]: val } }));
+    const [p, periodKey] = goalKey.split(":");
+    try {
+      await upsertGoal({
+        period: p,
+        periodKey,
+        metric: field,
+        value: Number(val) || 0,
+        createdBy: user.id,
+      });
+    } catch (e) {
+      setError(`Couldn't save goal: ${e.message || "unknown error"}`);
+      // Revert
+      setGoals((g) => {
+        const next = { ...g };
+        if (prev == null) {
+          const { [field]: _, ...rest } = next[goalKey] || {};
+          next[goalKey] = rest;
+        } else {
+          next[goalKey] = { ...(next[goalKey] || {}), [field]: prev };
+        }
+        return next;
+      });
     }
   };
 
@@ -433,119 +626,164 @@ export default function ForumDashboard() {
   const goalKey = `${period}:${ymd(range.start)}`;
   const currentGoal = goals[goalKey]?.netRevenue ?? 0;
   const onPace = currentGoal > 0 ? (summary.net / (currentGoal * (elapsedDays / totalDays))) * 100 : null;
-  const setGoal = (key, field, val) => {
-    setGoals(g => ({ ...g, [key]: { ...(g[key] || {}), [field]: val } }));
-  };
 
-  if (!loaded) {
-    return <div className="min-h-screen bg-[color:var(--paper)] flex items-center justify-center text-[color:var(--muted)] font-serif italic">Preparing the books…</div>;
-  }
-  if (rows.length === 0) {
+  const isOwner = profile?.role === "owner";
+
+  if (!loadedData) {
     return (
-      <div className="min-h-screen bg-[color:var(--paper)] flex items-center justify-center p-6">
-        <div className="max-w-2xl w-full">
-          <div className="text-[10px] tracking-[0.3em] uppercase text-[color:var(--accent)] mb-3">Forum Delano · Performance</div>
-          <h1 className="text-5xl font-serif text-[color:var(--ink)] leading-tight mb-3">The House Ledger</h1>
-          <p className="text-[color:var(--muted)] mb-8 font-serif italic text-lg">A studio for tracking what the Forum earns, week by week, court by court.</p>
-          <UploadZone onFiles={handleFiles} uploading={uploading} error={error} />
-          <div className="mt-6 text-xs text-[color:var(--muted)] leading-relaxed">
-            Drop PodPlay <em>Settlements</em> CSV exports. Multiple files merge automatically; duplicates are de-duped by transaction ID. Your data is stored locally to this dashboard.
-          </div>
-        </div>
+      <div className="min-h-screen bg-[color:var(--paper)] flex items-center justify-center text-[color:var(--muted)] font-serif italic">
+        Preparing the books…
       </div>
     );
   }
-  return (
-    <div className="min-h-screen bg-[color:var(--paper)] text-[color:var(--ink)]">
-      <header className="border-b border-[color:var(--line)] bg-[color:var(--paper)] sticky top-0 z-20 backdrop-blur">
-        <div className="max-w-[1400px] mx-auto px-6 py-4 flex items-center justify-between">
-          <div className="flex items-center gap-6">
-            <div>
-              <div className="text-[10px] tracking-[0.3em] uppercase text-[color:var(--accent)]">Forum Delano</div>
-              <div className="font-serif text-xl leading-none mt-0.5">The House Ledger</div>
-            </div>
-            <nav className="flex gap-1">
-              {[
-                ["overview", "Overview"],
-                ["periods", "Time Periods"],
-                ["mix", "Revenue Mix"],
-                ["members", "Memberships"],
-                ["goals", "Goals & Pacing"],
-                ["projections", "Projections"],
-              ].map(([k, l]) => (
-                <button
-                  key={k}
-                  onClick={() => setTab(k)}
-                  className={`text-xs px-3 py-2 tracking-wide transition-colors ${
-                    tab === k ? "text-[color:var(--ink)] font-semibold" : "text-[color:var(--muted)] hover:text-[color:var(--ink)]"
-                  }`}
-                >
-                  {l}
-                  {tab === k && <div className="h-0.5 bg-[color:var(--accent)] mt-1 -mb-3" />}
+
+  if (rows.length === 0) {
+    return (
+      <>
+        <div className="min-h-screen bg-[color:var(--paper)] flex items-center justify-center p-6">
+          <div className="max-w-2xl w-full">
+            <div className="flex items-start justify-between mb-3">
+              <div className="text-[10px] tracking-[0.3em] uppercase text-[color:var(--accent)]">Forum Delano · Performance</div>
+              <div className="flex items-center gap-3 text-xs text-[color:var(--muted)]">
+                <span>{profile?.email || user.email}</span>
+                <button onClick={signOut} className="flex items-center gap-1 hover:text-[color:var(--ink)]">
+                  <LogOut size={12} /> Sign out
                 </button>
-              ))}
-            </nav>
-          </div>
-          <div className="flex items-center gap-2">
-            <UploadButton onFiles={handleFiles} uploading={uploading} />
-            <button onClick={clearData} className="text-xs text-[color:var(--muted)] hover:text-[color:var(--bad)] p-2" title="Clear data">
-              <Trash2 size={14} />
-            </button>
-          </div>
-        </div>
-        <div className="max-w-[1400px] mx-auto px-6 py-3 flex items-center justify-between border-t border-[color:var(--line)]/50">
-          <div className="flex items-center gap-3">
-            <div className="text-[10px] tracking-[0.25em] uppercase text-[color:var(--muted)]">Viewing</div>
-            <div className="flex gap-1">
-              {Object.keys(PERIOD_DEFS).map(k => (
-                <Pill key={k} active={period === k} onClick={() => setPeriod(k)}>{PERIOD_DEFS[k].label}</Pill>
-              ))}
+              </div>
+            </div>
+            <h1 className="text-5xl font-serif text-[color:var(--ink)] leading-tight mb-3">The House Ledger</h1>
+            <p className="text-[color:var(--muted)] mb-8 font-serif italic text-lg">A studio for tracking what the Forum earns, week by week, court by court.</p>
+            <UploadZone onFiles={handleFiles} uploading={uploading} error={error} />
+            <div className="mt-6 text-xs text-[color:var(--muted)] leading-relaxed">
+              Drop PodPlay <em>Settlements</em> CSV exports. Multiple files merge automatically; duplicates are de-duped by transaction ID. Data syncs to Supabase so all invited team members see the same numbers.
             </div>
           </div>
-          <div className="flex items-center gap-3">
-            <button onClick={() => setAnchor(shiftAnchor(anchor, period, -1))} className="text-[color:var(--muted)] hover:text-[color:var(--ink)] w-8 h-8 flex items-center justify-center border border-[color:var(--line)]">‹</button>
-            <div className="font-serif text-lg min-w-[260px] text-center">{range.label}</div>
-            <button onClick={() => setAnchor(shiftAnchor(anchor, period, 1))} className="text-[color:var(--muted)] hover:text-[color:var(--ink)] w-8 h-8 flex items-center justify-center border border-[color:var(--line)]">›</button>
-            <button onClick={() => setAnchor(new Date())} className="text-xs text-[color:var(--muted)] hover:text-[color:var(--ink)] px-2">Today</button>
-          </div>
         </div>
-      </header>
-      <main className="max-w-[1400px] mx-auto px-6 py-8">
-        {error && <div className="mb-4 p-3 bg-[color:var(--accent)]/10 border border-[color:var(--accent)] text-sm">{error}</div>}
-        {tab === "overview" && (
-          <OverviewTab
-            summary={summary} prevSummary={prevSummary} pct={pct}
-            daily={daily} byArea={byArea} bySource={bySource}
-            period={period} range={range} projection={projection}
-            elapsedDays={elapsedDays} totalDays={totalDays} isComplete={isComplete}
-            currentGoal={currentGoal} memMetrics={memMetrics}
+        {showClearModal && (
+          <ConfirmClearModal
+            onConfirm={handleClearConfirm}
+            onCancel={() => setShowClearModal(false)}
+            clearing={clearing}
+            error={clearError}
           />
         )}
-        {tab === "periods" && <PeriodsTab rows={rows} period={period} anchor={anchor} />}
-        {tab === "mix" && <MixTab byArea={byArea} bySource={bySource} byEventType={byEventType} windowRows={windowRows} />}
-        {tab === "members" && <MembersTab memMetrics={memMetrics} customers={customers} />}
-        {tab === "goals" && (
-          <GoalsTab
-            period={period} range={range} goalKey={goalKey}
-            goals={goals} setGoal={setGoal}
-            summary={summary} projection={projection}
-            elapsedDays={elapsedDays} totalDays={totalDays} onPace={onPace}
-            daily={daily}
-          />
-        )}
-        {tab === "projections" && (
-          <ProjectionsTab
-            rows={rows} range={range}
-            summary={summary} daily={daily} projection={projection}
-            elapsedDays={elapsedDays} totalDays={totalDays} isComplete={isComplete}
-          />
-        )}
-      </main>
-      <footer className="max-w-[1400px] mx-auto px-6 py-8 border-t border-[color:var(--line)] text-xs text-[color:var(--muted)] flex justify-between">
-        <div>{rows.length.toLocaleString()} transactions loaded · {new Set(rows.map(r => r.email.toLowerCase())).size} unique customers overall</div>
-        <div className="font-serif italic">Forum Delano · House Ledger v1</div>
-      </footer>
-    </div>
+      </>
+    );
+  }
+
+  return (
+    <>
+      <div className="min-h-screen bg-[color:var(--paper)] text-[color:var(--ink)]">
+        <header className="border-b border-[color:var(--line)] bg-[color:var(--paper)] sticky top-0 z-20 backdrop-blur">
+          <div className="max-w-[1400px] mx-auto px-6 py-4 flex items-center justify-between">
+            <div className="flex items-center gap-6">
+              <div>
+                <div className="text-[10px] tracking-[0.3em] uppercase text-[color:var(--accent)]">Forum Delano</div>
+                <div className="font-serif text-xl leading-none mt-0.5">The House Ledger</div>
+              </div>
+              <nav className="flex gap-1">
+                {[
+                  ["overview", "Overview"],
+                  ["periods", "Time Periods"],
+                  ["mix", "Revenue Mix"],
+                  ["members", "Memberships"],
+                  ["goals", "Goals & Pacing"],
+                  ["projections", "Projections"],
+                ].map(([k, l]) => (
+                  <button
+                    key={k}
+                    onClick={() => setTab(k)}
+                    className={`text-xs px-3 py-2 tracking-wide transition-colors ${
+                      tab === k ? "text-[color:var(--ink)] font-semibold" : "text-[color:var(--muted)] hover:text-[color:var(--ink)]"
+                    }`}
+                  >
+                    {l}
+                    {tab === k && <div className="h-0.5 bg-[color:var(--accent)] mt-1 -mb-3" />}
+                  </button>
+                ))}
+              </nav>
+            </div>
+            <div className="flex items-center gap-3">
+              <UploadButton onFiles={handleFiles} uploading={uploading} />
+              {isOwner && (
+                <button
+                  onClick={requestClear}
+                  className="text-xs text-[color:var(--muted)] hover:text-[color:var(--bad)] p-2"
+                  title="Clear all data (owner only)"
+                >
+                  <Trash2 size={14} />
+                </button>
+              )}
+              <div className="hidden md:flex items-center gap-2 text-xs text-[color:var(--muted)] pl-3 border-l border-[color:var(--line)]">
+                <span>{profile?.email || user.email}</span>
+                <button onClick={signOut} className="flex items-center gap-1 hover:text-[color:var(--ink)]" title="Sign out">
+                  <LogOut size={12} />
+                </button>
+              </div>
+            </div>
+          </div>
+          <div className="max-w-[1400px] mx-auto px-6 py-3 flex items-center justify-between border-t border-[color:var(--line)]/50">
+            <div className="flex items-center gap-3">
+              <div className="text-[10px] tracking-[0.25em] uppercase text-[color:var(--muted)]">Viewing</div>
+              <div className="flex gap-1">
+                {Object.keys(PERIOD_DEFS).map(k => (
+                  <Pill key={k} active={period === k} onClick={() => setPeriod(k)}>{PERIOD_DEFS[k].label}</Pill>
+                ))}
+              </div>
+            </div>
+            <div className="flex items-center gap-3">
+              <button onClick={() => setAnchor(shiftAnchor(anchor, period, -1))} className="text-[color:var(--muted)] hover:text-[color:var(--ink)] w-8 h-8 flex items-center justify-center border border-[color:var(--line)]">‹</button>
+              <div className="font-serif text-lg min-w-[260px] text-center">{range.label}</div>
+              <button onClick={() => setAnchor(shiftAnchor(anchor, period, 1))} className="text-[color:var(--muted)] hover:text-[color:var(--ink)] w-8 h-8 flex items-center justify-center border border-[color:var(--line)]">›</button>
+              <button onClick={() => setAnchor(new Date())} className="text-xs text-[color:var(--muted)] hover:text-[color:var(--ink)] px-2">Today</button>
+            </div>
+          </div>
+        </header>
+        <main className="max-w-[1400px] mx-auto px-6 py-8">
+          {error && <div className="mb-4 p-3 bg-[color:var(--accent)]/10 border border-[color:var(--accent)] text-sm">{error}</div>}
+          {tab === "overview" && (
+            <OverviewTab
+              summary={summary} prevSummary={prevSummary} pct={pct}
+              daily={daily} byArea={byArea} bySource={bySource}
+              period={period} range={range} projection={projection}
+              elapsedDays={elapsedDays} totalDays={totalDays} isComplete={isComplete}
+              currentGoal={currentGoal} memMetrics={memMetrics}
+            />
+          )}
+          {tab === "periods" && <PeriodsTab rows={rows} period={period} anchor={anchor} />}
+          {tab === "mix" && <MixTab byArea={byArea} bySource={bySource} byEventType={byEventType} windowRows={windowRows} />}
+          {tab === "members" && <MembersTab memMetrics={memMetrics} customers={customers} />}
+          {tab === "goals" && (
+            <GoalsTab
+              period={period} range={range} goalKey={goalKey}
+              goals={goals} setGoal={setGoal}
+              summary={summary} projection={projection}
+              elapsedDays={elapsedDays} totalDays={totalDays} onPace={onPace}
+              daily={daily}
+            />
+          )}
+          {tab === "projections" && (
+            <ProjectionsTab
+              rows={rows} range={range}
+              summary={summary} daily={daily} projection={projection}
+              elapsedDays={elapsedDays} totalDays={totalDays} isComplete={isComplete}
+            />
+          )}
+        </main>
+        <footer className="max-w-[1400px] mx-auto px-6 py-8 border-t border-[color:var(--line)] text-xs text-[color:var(--muted)] flex justify-between">
+          <div>{rows.length.toLocaleString()} transactions loaded · {new Set(rows.map(r => r.email.toLowerCase())).size} unique customers overall</div>
+          <div className="font-serif italic">Forum Delano · House Ledger v1</div>
+        </footer>
+      </div>
+      {showClearModal && (
+        <ConfirmClearModal
+          onConfirm={handleClearConfirm}
+          onCancel={() => setShowClearModal(false)}
+          clearing={clearing}
+          error={clearError}
+        />
+      )}
+    </>
   );
 }
 
@@ -1040,7 +1278,7 @@ function UploadZone({ onFiles, uploading, error }) {
       <label className="inline-block cursor-pointer">
         <input type="file" accept=".csv" multiple className="hidden" onChange={(e) => e.target.files?.length && onFiles(Array.from(e.target.files))} />
         <span className="inline-block bg-[color:var(--ink)] text-[color:var(--paper)] px-6 py-2.5 text-xs tracking-wider uppercase">
-          {uploading ? "Parsing..." : "Browse files"}
+          {uploading ? "Uploading..." : "Browse files"}
         </span>
       </label>
       {error && <div className="mt-4 text-[color:var(--bad)] text-sm">{error}</div>}
@@ -1052,7 +1290,7 @@ function UploadButton({ onFiles, uploading }) {
     <label className="cursor-pointer inline-flex items-center gap-1.5 text-xs border border-[color:var(--line)] px-3 py-1.5 hover:border-[color:var(--ink)] transition-colors">
       <input type="file" accept=".csv" multiple className="hidden" onChange={(e) => e.target.files?.length && onFiles(Array.from(e.target.files))} />
       <Upload size={12} />
-      {uploading ? "Parsing..." : "Add CSV"}
+      {uploading ? "Uploading..." : "Add CSV"}
     </label>
   );
 }
